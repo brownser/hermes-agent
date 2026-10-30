@@ -7,11 +7,16 @@ import contextvars
 import logging
 import queue
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
 # A parked worker exits after this long without work, so a burst's threads do not outlive it by much.
 _IDLE_TIMEOUT_S = 60.0
+
+# Bound for the spawn handshake in ``shutdown``: a submitter registers its thread, then spawns it
+# outside the lock, so shutdown must not join a thread that is still being created.
+_SPAWN_HANDSHAKE_TIMEOUT_S = 5.0
 
 
 class _Worker:
@@ -46,15 +51,21 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
         self._threads: set = set()
         self._idle: list[_Worker] = []
         self._shutdown = False
-        self._lock = threading.Lock()
+        # Condition (not Lock): shutdown waits on it for a spawn that a submitter is performing
+        # outside the lock.
+        self._lock = threading.Condition()
         self._n = 0
+        self._starting = 0
         self._idle_timeout = idle_timeout
 
     def submit(self, fn, /, *args, **kwargs):
         fut: concurrent.futures.Future = concurrent.futures.Future()
         item = (fut, fn, args, kwargs)
-        # One critical section for check + hand-off/start + register (as ThreadPoolExecutor.submit does), so a
-        # concurrent shutdown() either refuses this item or sees its thread; never a live, uncounted one.
+        # One critical section for the check + hand-off/registration (as ThreadPoolExecutor.submit
+        # does), so a concurrent shutdown() either refuses this item or sees its thread; never a
+        # live, uncounted one. The SPAWN is not in that section: Thread.start() waits until the new
+        # thread gets the GIL, and this call arrives on the event loop, so holding the lock across
+        # it serialised the loop behind every spawn (and behind any other submitter's spawn).
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("cannot schedule new futures after shutdown")
@@ -68,10 +79,23 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
             # health: allow HX012 -- a worker serves many items; each runs in a fresh empty Context, as a new thread would
             t = threading.Thread(target=self._work, args=(worker, item), name=f"{self._prefix}_{self._n}", daemon=True)
             worker.thread = t
-            # Start BEFORE registering: at the OS thread limit start() raises, and an unstarted thread
-            # left in _threads would make shutdown's join() raise and skip the quiesce decision.
-            t.start()
+            # Register BEFORE starting: at the OS thread limit start() raises, and an unstarted
+            # thread left in _threads would make shutdown's join() raise and skip the quiesce
+            # decision; registering first also means the worker's own discard (in _park) can never
+            # beat this add.
             self._threads.add(t)
+            self._starting += 1
+        try:
+            t.start()
+        except BaseException:
+            with self._lock:
+                self._threads.discard(t)
+                self._starting -= 1
+                self._lock.notify_all()
+            raise
+        with self._lock:
+            self._starting -= 1
+            self._lock.notify_all()
         return fut
 
     def _work(self, worker: _Worker, item) -> None:
@@ -116,10 +140,20 @@ class _UnboundedThreadExecutor(concurrent.futures.Executor):
         # cancel_futures is accepted for API parity only: there is no queue, so nothing is pending.
         with self._lock:
             self._shutdown = True
+            # A submitter that passed the check above has registered its thread and is spawning it
+            # without the lock; wait for that spawn so every thread exposed here (and every join
+            # below) is a started one.
+            deadline = time.monotonic() + _SPAWN_HANDSHAKE_TIMEOUT_S
+            while self._starting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._lock.wait(remaining)
             threads = list(self._threads)
             idle, self._idle = self._idle, []
         for worker in idle:
             worker.inbox.put(None)
         if wait:
             for t in threads:
-                t.join()
+                if t.ident is not None:  # a spawn still in flight past the handshake is not joinable
+                    t.join()

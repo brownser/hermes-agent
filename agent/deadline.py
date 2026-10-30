@@ -3,8 +3,9 @@
 * :func:`resolve_timeout` — ``timeouts:`` in config.yaml > legacy env var > default.
 * :func:`clamp_timeout` — huge timeouts overflow ``time_t`` in ``Lock.acquire`` /
   ``Thread.join`` on macOS (#83220), so every timeout is capped.
-* :func:`run_bounded_async` / :func:`run_bounded_sync` — wall-clock deadlines driven by
-  a daemon ``threading.Timer`` / worker thread, so a blocked event loop cannot disable them.
+* :func:`run_bounded_async` / :func:`run_bounded_sync` — wall-clock deadlines driven by a
+  daemon deadline thread (pushed, never spawned per call) / worker thread, so a blocked event
+  loop cannot disable them.
 * :func:`kill_process_tree` — portable whole-tree termination.
 * :func:`poll_until` — the one "check until it holds or the deadline passes" loop; use it
   instead of hand-writing ``deadline = time.monotonic() + t; while ...: time.sleep(...)``.
@@ -20,6 +21,7 @@ import asyncio
 import contextvars
 from contextlib import contextmanager
 import faulthandler
+import heapq
 import logging
 import os
 import subprocess
@@ -209,17 +211,88 @@ def resolve_timeout(key: str, *, default: Optional[float], env_var: Optional[str
     return clamp_timeout(default)
 
 
+# --- Off-loop deadline scheduling ----------------------------------------------
+# A deadline has to be enforced from a thread the loop cannot stall, but CREATING that thread on the
+# loop defeats the purpose: ``Thread.start()`` waits until the new thread gets the GIL, and a busy
+# gateway runs a few hundred threads, so every ``threading.Timer`` started here put a spawn (and its
+# contention) on the event loop — the very thing these dumps exist to witness. Deadlines are
+# therefore pushed onto ONE module-level daemon thread that owns a deadline heap, and
+# ``run_bounded_async`` only pushes an entry. The thread is created once, on first use.
+
+
+class _DeadlineHandle:
+    """A pushed deadline; ``cancel()`` makes the scheduler drop it when its turn comes."""
+
+    __slots__ = ("_callback", "_cancelled")
+
+    def __init__(self, callback: Callable[[], None]):
+        self._callback = callback
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def fire(self) -> None:
+        if self._cancelled:
+            return
+        try:
+            self._callback()
+        except Exception:
+            logger.debug("deadline timer callback failed", exc_info=True)
+
+
+class _DeadlineScheduler:
+    """One daemon thread; a heap of ``(due, sequence, handle)``; callbacks run on that thread."""
+
+    def __init__(self, name: str = "deadline-timer"):
+        self._name = name
+        self._cond = threading.Condition()
+        self._heap: list[tuple[float, int, _DeadlineHandle]] = []
+        self._seq = 0
+        self._thread: Optional[threading.Thread] = None
+
+    def push(self, delay_s: float, callback: Callable[[], None]) -> _DeadlineHandle:
+        """Schedule ``callback`` ``delay_s`` from now on the timer thread; returns its handle."""
+        handle = _DeadlineHandle(callback)
+        with self._cond:
+            self._seq += 1
+            heapq.heappush(self._heap, (time.monotonic() + max(delay_s, 0.0), self._seq, handle))
+            if self._thread is None:
+                # A process-wide timer thread must NOT inherit any one caller's profile scope: each
+                # deadline returns to its own loop, which re-enters the owning scope. ContextVars do
+                # not cross a bare Thread, and copying them from whichever caller happens to push
+                # first would leak that caller's scope into every other caller's callback.
+                # health: allow HX012 -- process-wide deadline thread; each callback returns to its own loop
+                self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
+                self._thread.start()
+            self._cond.notify()
+        return handle
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while True:
+                    if not self._heap:
+                        self._cond.wait()
+                        continue
+                    due, _, handle = self._heap[0]
+                    remaining = due - time.monotonic()
+                    if remaining > 0:
+                        self._cond.wait(remaining)
+                        continue
+                    heapq.heappop(self._heap)
+                    break
+            handle.fire()
+
+
+_deadline_scheduler = _DeadlineScheduler()
+
+
 # --- Bounded execution — async flavor ------------------------------------------
-# The deadline is a daemon threading.Timer so a blocked event loop cannot disable it; a
-# second timer dumps all thread stacks when the loop provably failed to process the expiry.
-
-
-# --------------------------------------------------------------------------- Bounded execution — async
-# flavor. Generalizes plugins/platforms/telegram/adapter.py:_await_with_thread_deadline (the #63309 fix):
-# the deadline is driven by a daemon threading.Timer so a blocked event loop cannot disable it, and a second
-# timer dumps all thread stacks when the loop provably failed to process the expiry — the one piece of
+# Generalizes plugins/platforms/telegram/adapter.py:_await_with_thread_deadline (the #63309 fix):
+# the deadline is driven off-loop so a blocked event loop cannot disable it, and a second deadline
+# dumps all thread stacks when the loop provably failed to process the expiry — the one piece of
 # information loop-blocked hangs otherwise never surface.
-# ---------------------------------------------------------------------------
 def _consume_abandoned(task: asyncio.Future[Any]) -> None:
     """Observe an abandoned task's outcome so it never logs 'never retrieved'."""
     try:
@@ -290,12 +363,16 @@ async def run_bounded_async(
         if not loop_processed_expiry.is_set():
             _dump_blocked_loop_diagnostics(label, timeout_s)
 
-    timers = [threading.Timer(timeout_s, lambda: loop.call_soon_threadsafe(_mark_expired))]
+    def _request_expiry() -> None:
+        """Runs on the timer thread; the expiry itself must be processed by the loop."""
+        try:
+            loop.call_soon_threadsafe(_mark_expired)
+        except RuntimeError:  # loop already closed: nothing left to expire
+            pass
+
+    handles = [_deadline_scheduler.push(timeout_s, _request_expiry)]
     if dump_on_blocked_loop:
-        timers.append(threading.Timer(timeout_s + _LOOP_BLOCKED_DUMP_GRACE_S, _watchdog_check))
-    for t in timers:
-        t.daemon = True
-        t.start()
+        handles.append(_deadline_scheduler.push(timeout_s + _LOOP_BLOCKED_DUMP_GRACE_S, _watchdog_check))
     try:
         try:
             done, _ = await asyncio.wait({task, deadline}, return_when=asyncio.FIRST_COMPLETED)
@@ -316,10 +393,10 @@ async def run_bounded_async(
         logger.warning("[deadline] %r timed out after %.1fs; task abandoned", label, timeout_s)
         return _result(start, timeout_s, label, timed_out=True)
     finally:
-        for t in timers:
-            t.cancel()
-        # cancel() cannot stop a Timer whose callback is already running; setting the
-        # event closes that race so a completed await is never misreported as blocked.
+        for handle in handles:
+            handle.cancel()
+        # cancel() cannot stop a callback that is already running; setting the event closes that
+        # race so a completed await is never misreported as blocked.
         loop_processed_expiry.set()
 
 
